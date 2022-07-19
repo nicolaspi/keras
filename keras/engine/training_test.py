@@ -3560,6 +3560,87 @@ class TestTrainingWithMetrics(test_combinations.TestCase):
         self.assertEqual(self.evaluate(acc_obj.count), 10)
 
     @test_combinations.run_all_keras_modes
+    def test_metric_compute_per_batch(self):
+        model = sequential.Sequential()
+        model.add(layers_module.Dense(3, activation="relu", input_dim=4))
+        model.add(layers_module.Dense(1, activation="sigmoid"))
+        acc_obj = metrics_module.BinaryAccuracy()
+
+        test_suite = self
+
+        class MetricCheck(keras.callbacks.Callback):
+            def __init__(self, is_compute_per_batch):
+                self._is_compute_per_batch = is_compute_per_batch
+
+            def test_per_batch_logs(self, logs):
+                test_suite.assertIsNotNone(logs)
+                test_suite.assertIn("loss", logs)
+                if not self._is_compute_per_batch:
+                    test_suite.assertNotIn(acc_obj.name, logs)
+                else:
+                    test_suite.assertIn(acc_obj.name, logs)
+
+            def test_logs(self, logs):
+                test_suite.assertIsNotNone(logs)
+                test_suite.assertIn("loss", logs)
+                test_suite.assertIn(acc_obj.name, logs)
+                test_suite.assertIn("val_loss", logs)
+                test_suite.assertIn("val_" + acc_obj.name, logs)
+                test_suite.assertGreater(acc_obj.count, 0)
+
+            def on_train_batch_end(self, batch, logs=None):
+                self.test_per_batch_logs(logs)
+
+            def on_test_batch_end(self, batch, logs=None):
+                self.test_per_batch_logs(logs)
+
+            def on_epoch_end(self, epoch, epoch_logs=None):
+                self.test_logs(epoch_logs)
+
+        model.compile(
+            loss="mae",
+            metrics=[acc_obj],
+            optimizer=RMSPropOptimizer(learning_rate=0.001),
+            run_eagerly=test_utils.should_run_eagerly(),
+        )
+
+        x = np.random.random((100, 4))
+        y = np.random.randint(0, 2, (100, 1))
+        model.fit(
+            x,
+            y,
+            validation_split=0.5,
+            batch_size=5,
+            epochs=2,
+            callbacks=[MetricCheck(True)],
+            compute_metrics_per_batch=True,
+        )
+        model.fit(
+            x,
+            y,
+            validation_split=0.5,
+            batch_size=5,
+            epochs=2,
+            callbacks=[MetricCheck(False)],
+            compute_metrics_per_batch=False,
+        )
+        model.evaluate(
+            x,
+            y,
+            batch_size=5,
+            callbacks=[MetricCheck(True)],
+            compute_metrics_per_batch=True,
+        )
+
+        model.evaluate(
+            x,
+            y,
+            batch_size=5,
+            callbacks=[MetricCheck(False)],
+            compute_metrics_per_batch=False,
+        )
+
+    @test_combinations.run_all_keras_modes
     def test_metric_state_reset_between_test_on_batch_and_evaluate(self):
         model = sequential.Sequential()
         model.add(layers_module.Dense(3, activation="relu", input_dim=4))
@@ -3853,8 +3934,8 @@ class TestTrainingWithMetrics(test_combinations.TestCase):
         # Verify that the metrics added using `compile` and `add_metric` API are
         # included
         self.assertEqual(
-            [m.name for m in model.metrics],
-            ["loss", "metric_4", "metric_2", "metric_1", "metric_3"],
+            set([m.name for m in model.metrics]),
+            {"loss", "metric_4", "metric_2", "metric_1", "metric_3"},
         )
 
     @test_combinations.run_all_keras_modes(always_skip_v1=True)
@@ -3882,7 +3963,7 @@ class TestTrainingWithMetrics(test_combinations.TestCase):
         model.fit(x, y, epochs=2, batch_size=5, validation_data=(x, y))
 
         self.assertEqual(
-            [m.name for m in model.metrics], ["loss", "acc", "metric_1"]
+            set([m.name for m in model.metrics]), {"loss", "acc", "metric_1"}
         )
 
     @test_combinations.run_all_keras_modes
@@ -4226,8 +4307,8 @@ class TestTrainingWithMetrics(test_combinations.TestCase):
         inner_model.fit(np.ones((10, 1)), np.ones((10, 1)), batch_size=10)
 
         self.assertEqual(
-            [m.name for m in inner_model.metrics],
-            ["loss", "acc", "mean", "mean1"],
+            set([m.name for m in inner_model.metrics]),
+            {"loss", "acc", "mean", "mean1"},
         )
 
         x = layers_module.Input(shape=[1])
@@ -4245,8 +4326,8 @@ class TestTrainingWithMetrics(test_combinations.TestCase):
         )
         outer_model.fit(np.ones((10, 1)), np.ones((10, 1)), batch_size=10)
         self.assertEqual(
-            [m.name for m in outer_model.metrics],
-            ["loss", "acc2", "mean", "mean1", "mean2"],
+            set([m.name for m in outer_model.metrics]),
+            {"loss", "acc2", "mean", "mean1", "mean2"},
         )
 
     @test_combinations.run_all_keras_modes(always_skip_v1=True)

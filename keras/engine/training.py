@@ -790,6 +790,19 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
         return False
 
     @property
+    def _loss_and_layer_metrics(self):
+        metrics = []
+        if self._is_compiled:
+            # TODO(omalleyt): Track `LossesContainer` and `MetricsContainer`
+            # objects so that attr names are not load-bearing.
+            if self.compiled_loss is not None:
+                metrics += self.compiled_loss.metrics
+
+        for l in self._flatten_layers():
+            metrics.extend(l._metrics)
+        return metrics
+
+    @property
     def metrics(self):
         """Returns the model's metrics added using `compile()`, `add_metric()` APIs.
 
@@ -826,17 +839,12 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
         'out_1_acc', 'mean']
 
         """
-        metrics = []
+        metrics = self._loss_and_layer_metrics
         if self._is_compiled:
             # TODO(omalleyt): Track `LossesContainer` and `MetricsContainer`
             # objects so that attr names are not load-bearing.
-            if self.compiled_loss is not None:
-                metrics += self.compiled_loss.metrics
             if self.compiled_metrics is not None:
-                metrics += self.compiled_metrics.metrics
-
-        for l in self._flatten_layers():
-            metrics.extend(l._metrics)
+                metrics.extend(self.compiled_metrics.metrics)
         return metrics
 
     @property
@@ -980,12 +988,6 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
 
         Args:
           data: A nested structure of `Tensor`s.
-
-        Returns:
-          A `dict` containing values that will be passed to
-          `tf.keras.callbacks.CallbackList.on_train_batch_end`. Typically, the
-          values of the `Model`'s metrics are returned. Example:
-          `{'loss': 0.2, 'accuracy': 0.7}`.
         """
         x, y, sample_weight = data_adapter.unpack_x_y_sample_weight(data)
         # Run forward pass.
@@ -995,7 +997,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
         self._validate_target_and_loss(y, loss)
         # Run backwards pass.
         self.optimizer.minimize(loss, self.trainable_variables, tape=tape)
-        return self.compute_metrics(x, y, y_pred, sample_weight)
+        self.compiled_metrics.update_state(y, y_pred, sample_weight)
 
     def compute_loss(self, x=None, y=None, y_pred=None, sample_weight=None):
         """Compute the total loss, validate it, and return it.
@@ -1053,46 +1055,10 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
             y, y_pred, sample_weight, regularization_losses=self.losses
         )
 
-    def compute_metrics(self, x, y, y_pred, sample_weight):
-        """Update metric states and collect all metrics to be returned.
-
-        Subclasses can optionally override this method to provide custom metric
-        updating and collection logic.
-
-        Example:
-        ```python
-        class MyModel(tf.keras.Sequential):
-
-          def compute_metrics(self, x, y, y_pred, sample_weight):
-
-            # This super call updates `self.compiled_metrics` and returns
-            # results for all metrics listed in `self.metrics`.
-            metric_results = super(MyModel, self).compute_metrics(
-                x, y, y_pred, sample_weight)
-
-            # Note that `self.custom_metric` is not listed in `self.metrics`.
-            self.custom_metric.update_state(x, y, y_pred, sample_weight)
-            metric_results['custom_metric_name'] = self.custom_metric.result()
-            return metric_results
-        ```
-
-        Args:
-          x: Input data.
-          y: Target data.
-          y_pred: Predictions returned by the model (output of `model.call(x)`)
-          sample_weight: Sample weights for weighting the loss function.
-
-        Returns:
-          A `dict` containing values that will be passed to
-          `tf.keras.callbacks.CallbackList.on_train_batch_end()`. Typically, the
-          values of the metrics listed in `self.metrics` are returned. Example:
-          `{'loss': 0.2, 'accuracy': 0.7}`.
-        """
-        del x  # The default implementation does not use `x`.
-        self.compiled_metrics.update_state(y, y_pred, sample_weight)
+    def _compute_metrics(self, metrics):
         # Collect metrics to return
         return_metrics = {}
-        for metric in self.metrics:
+        for metric in metrics:
             result = metric.result()
             if isinstance(result, dict):
                 return_metrics.update(result)
@@ -1132,22 +1098,15 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
             """Runs a single training step."""
 
             def run_step(data):
-                outputs = model.train_step(data)
-                # Ensure counter is updated only if `train_step` succeeds.
-                with tf.control_dependencies(_minimum_control_deps(outputs)):
-                    model._train_counter.assign_add(1)
-                return outputs
+                model.train_step(data)
+                model._train_counter.assign_add(1)
 
             if self._jit_compile:
                 run_step = tf.function(
                     run_step, jit_compile=True, reduce_retracing=True
                 )
             data = next(iterator)
-            outputs = model.distribute_strategy.run(run_step, args=(data,))
-            outputs = reduce_per_replica(
-                outputs, self.distribute_strategy, reduction="first"
-            )
-            return outputs
+            model.distribute_strategy.run(run_step, args=(data,))
 
         # Special case if steps_per_execution is one.
         if (
@@ -1157,7 +1116,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
 
             def train_function(iterator):
                 """Runs a training execution with a single step."""
-                return step_function(self, iterator)
+                step_function(self, iterator)
 
             if not self.run_eagerly:
                 train_function = tf.function(
@@ -1182,8 +1141,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
             def train_function(iterator, steps_per_execution):
                 """Runs a training execution with multiple steps."""
                 for _ in tf.range(steps_per_execution):
-                    outputs = step_function(self, iterator)
-                return outputs
+                    step_function(self, iterator)
 
             if not self.run_eagerly:
                 train_function = tf.function(
@@ -1199,8 +1157,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
             def train_function(iterator):
                 """Runs a training execution with multiple steps."""
                 for _ in tf.range(self._steps_per_execution):
-                    outputs = step_function(self, iterator)
-                return outputs
+                    step_function(self, iterator)
 
             if not self.run_eagerly:
                 train_function = tf.function(
@@ -1233,6 +1190,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
         max_queue_size=10,
         workers=1,
         use_multiprocessing=False,
+        compute_metrics_per_batch=True,
     ):
         """Trains the model for a fixed number of epochs (iterations on a dataset).
 
@@ -1545,6 +1503,10 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                 steps_per_epoch_inferred, initial_epoch
             )
             logs = None
+            if compute_metrics_per_batch:
+                per_batch_metrics = Model.metrics
+            else:
+                per_batch_metrics = Model._loss_and_layer_metrics
             for epoch, iterator in data_handler.enumerate_epochs():
                 self.reset_metrics()
                 callbacks.on_epoch_begin(epoch)
@@ -1561,7 +1523,10 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                             _r=1,
                         ):
                             callbacks.on_train_batch_begin(step)
-                            tmp_logs = self.train_function(iterator)
+                            self.train_function(iterator)
+                            tmp_logs = self._compute_metrics(
+                                per_batch_metrics.fget(self)
+                            )
                             if data_handler.should_sync:
                                 context.async_wait()
                             # No error, now safe to assign to logs.
@@ -1570,6 +1535,8 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                             callbacks.on_train_batch_end(end_step, logs)
                             if self.stop_training:
                                 break
+                if not compute_metrics_per_batch:
+                    logs.update(self._compute_metrics(self.metrics))
 
                 logs = tf_utils.sync_to_numpy_or_python_type(logs)
                 if logs is None:
@@ -1614,6 +1581,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                         workers=workers,
                         use_multiprocessing=use_multiprocessing,
                         return_dict=True,
+                        compute_metrics_per_batch=compute_metrics_per_batch,
                         _use_cached_eval_dataset=True,
                     )
                     val_logs = {
@@ -1654,18 +1622,13 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
 
         Args:
           data: A nested structure of `Tensor`s.
-
-        Returns:
-          A `dict` containing values that will be passed to
-          `tf.keras.callbacks.CallbackList.on_train_batch_end`. Typically, the
-          values of the `Model`'s metrics are returned.
         """
         x, y, sample_weight = data_adapter.unpack_x_y_sample_weight(data)
 
         y_pred = self(x, training=False)
         # Updates stateful loss metrics.
         self.compute_loss(x, y, y_pred, sample_weight)
-        return self.compute_metrics(x, y, y_pred, sample_weight)
+        self.compiled_metrics.update_state(y, y_pred, sample_weight)
 
     def make_test_function(self, force=False):
         """Creates a function that executes one step of evaluation.
@@ -1698,11 +1661,8 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
             """Runs a single evaluation step."""
 
             def run_step(data):
-                outputs = model.test_step(data)
-                # Ensure counter is updated only if `test_step` succeeds.
-                with tf.control_dependencies(_minimum_control_deps(outputs)):
-                    model._test_counter.assign_add(1)
-                return outputs
+                model.test_step(data)
+                model._test_counter.assign_add(1)
 
             if self._jit_compile:
                 run_step = tf.function(
@@ -1710,11 +1670,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                 )
 
             data = next(iterator)
-            outputs = model.distribute_strategy.run(run_step, args=(data,))
-            outputs = reduce_per_replica(
-                outputs, self.distribute_strategy, reduction="first"
-            )
-            return outputs
+            model.distribute_strategy.run(run_step, args=(data,))
 
         # Special case if steps_per_execution is one.
         if (
@@ -1724,7 +1680,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
 
             def test_function(iterator):
                 """Runs a test execution with a single step."""
-                return step_function(self, iterator)
+                step_function(self, iterator)
 
             if not self.run_eagerly:
                 test_function = tf.function(
@@ -1748,8 +1704,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
             def test_function(iterator, steps_per_execution):
                 """Runs a test execution with multiple steps."""
                 for _ in tf.range(steps_per_execution):
-                    outputs = step_function(self, iterator)
-                return outputs
+                    step_function(self, iterator)
 
             if not self.run_eagerly:
                 test_function = tf.function(
@@ -1764,8 +1719,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
             def test_function(iterator):
                 """Runs a test execution with multiple steps."""
                 for _ in tf.range(self._steps_per_execution):
-                    outputs = step_function(self, iterator)
-                return outputs
+                    step_function(self, iterator)
 
             if not self.run_eagerly:
                 test_function = tf.function(
@@ -1789,6 +1743,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
         workers=1,
         use_multiprocessing=False,
         return_dict=False,
+        compute_metrics_per_batch=True,
         **kwargs,
     ):
         """Returns the loss value & metrics values for the model in test mode.
@@ -1933,6 +1888,10 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                 )
 
             logs = {}
+            if compute_metrics_per_batch:
+                per_batch_metrics = Model.metrics
+            else:
+                per_batch_metrics = Model._loss_and_layer_metrics
             self.test_function = self.make_test_function()
             self._test_counter.assign(0)
             callbacks.on_test_begin()
@@ -1944,13 +1903,18 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                             "test", step_num=step, _r=1
                         ):
                             callbacks.on_test_batch_begin(step)
-                            tmp_logs = self.test_function(iterator)
+                            self.test_function(iterator)
+                            tmp_logs = self._compute_metrics(
+                                per_batch_metrics.fget(self)
+                            )
                             if data_handler.should_sync:
                                 context.async_wait()
                             # No error, now safe to assign to logs.
                             logs = tmp_logs
                             end_step = step + data_handler.step_increment
                             callbacks.on_test_batch_end(end_step, logs)
+            if not compute_metrics_per_batch:
+                logs.update(self._compute_metrics(self.metrics))
             logs = tf_utils.sync_to_numpy_or_python_type(logs)
             callbacks.on_test_end(logs=logs)
 
@@ -2378,8 +2342,8 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                 self.distribute_strategy, x, y, sample_weight, class_weight
             )
             self.train_function = self.make_train_function()
-            logs = self.train_function(iterator)
-
+            self.train_function(iterator)
+            logs = self._compute_metrics(self.metrics)
         logs = tf_utils.sync_to_numpy_or_python_type(logs)
         if return_dict:
             return logs
@@ -2439,8 +2403,8 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                 self.distribute_strategy, x, y, sample_weight
             )
             self.test_function = self.make_test_function()
-            logs = self.test_function(iterator)
-
+            self.test_function(iterator)
+            logs = self._compute_metrics(self.metrics)
         logs = tf_utils.sync_to_numpy_or_python_type(logs)
         if return_dict:
             return logs
